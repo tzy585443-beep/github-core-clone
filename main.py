@@ -22,6 +22,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import gitstore  # noqa: E402
+import gql  # noqa: E402
+import mcp  # noqa: E402
 import rest  # noqa: E402
 from store import get_store  # noqa: E402
 
@@ -32,6 +34,7 @@ RETRY_MAX = 1.0
 REASONS = {
     200: "OK",
     201: "Created",
+    202: "Accepted",
     204: "No Content",
     400: "Bad Request",
     401: "Unauthorized",
@@ -205,7 +208,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         host = self.headers.get("Host", "localhost")
         try:
-            if gitstore.parse_git_path(pth) is not None:
+            if pth == "/api/graphql":
+                result = gql.handle(body) if method == "POST" else (404, rest.NOT_FOUND, rest.JSON, ())
+            elif pth == "/mcp":
+                result = mcp.handle(body) if method == "POST" else (405, rest.NOT_FOUND, rest.JSON, ())
+            elif gitstore.parse_git_path(pth) is not None:
                 result = gitstore.handle_git(method, pth, query, body, self.headers.get("Git-Protocol", ""))
             else:
                 result = rest.handle_rest(method, pth, query, body, host)
