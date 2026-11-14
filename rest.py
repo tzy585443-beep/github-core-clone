@@ -6,6 +6,7 @@ rel="next" once a collection fills more than one page.
 
 from __future__ import annotations
 
+import base64
 import json
 from urllib.parse import parse_qs, unquote
 
@@ -154,6 +155,13 @@ def _user_repos(method: str, body: bytes, query: dict, host: str, path: str, sto
         if data is BAD:
             return 400, BAD_JSON, JSON, ()
         status, payload = store.create_repo(data)
+        if status == 201:
+            from gitstore import ensure_git
+
+            repo = store.get_repo(store.login, data.get("name", ""))
+            if repo is not None:
+                ensure_git(repo, store)
+                payload = store.repo_public(repo)
         return status, dumps(payload), JSON, ()
     if method == "GET":
         repos = store.list_repos()
@@ -207,6 +215,10 @@ def _repo_routes(
         return _labels(method, repo, tail[1:], body, store)
     if head == "issues":
         return _issues(method, repo, tail[1:], query, body, host, path, store)
+    if head == "contents":
+        return _contents(method, repo, tail[1:], query, body, store)
+    if head == "pulls":
+        return _pulls(method, repo, tail[1:], query, body, host, path, store)
     return 404, NOT_FOUND, JSON, ()
 
 
@@ -266,9 +278,12 @@ def _issues(
     number = int(rest[0])
     if method == "GET":
         cached = store.issue_bytes(repo, number)
-        if cached is None:
-            return 404, NOT_FOUND, JSON, ()
-        return 200, cached, JSON, ()
+        if cached is not None:
+            return 200, cached, JSON, ()
+        pull = repo.pulls.get(number)
+        if pull is not None:
+            return 200, dumps(store.pull_as_issue(repo, pull)), JSON, ()
+        return 404, NOT_FOUND, JSON, ()
     if method == "PATCH":
         with repo.lock:
             issue = repo.issues.get(number)
@@ -278,5 +293,176 @@ def _issues(
         if data is BAD:
             return 400, BAD_JSON, JSON, ()
         status, payload = store.update_issue(repo, issue, data)
+        return status, dumps(payload), JSON, ()
+    return 404, NOT_FOUND, JSON, ()
+
+
+def _author(store: Store) -> tuple[str, str, str]:
+    login = store.login
+    return login, f"{login}@users.noreply.github.com", store.now
+
+
+def _contents(method: str, repo: Repo, rest: list[str], query: dict, body: bytes, store: Store) -> tuple:
+    from gitstore import ensure_git
+
+    path = "/".join(rest)
+    git = ensure_git(repo, store)
+    branch = (query.get("ref") or query.get("branch") or [repo.default_branch])[0]
+    if method == "GET":
+        return _contents_get(repo, git, branch, path, store)
+    data = parse_body(body)
+    if data is BAD:
+        return 400, BAD_JSON, JSON, ()
+    if isinstance(data, dict) and isinstance(data.get("branch"), str) and data.get("branch"):
+        branch = data["branch"]
+    name, email, when = _author(store)
+    message = data.get("message") if isinstance(data, dict) else None
+    if not isinstance(message, str) or not message:
+        message = f"Delete {path}" if method == "DELETE" else f"Update {path}"
+    if method == "DELETE":
+        sha = data.get("sha") if isinstance(data.get("sha"), str) else None
+        result = git.delete_file(branch, path, message, name, email, when, sha)
+        if result.status == "missing":
+            return 404, NOT_FOUND, JSON, ()
+        if result.status == "mismatch":
+            return 409, dumps({"message": "sha does not match"}), JSON, ()
+        return 200, dumps({"commit": {"sha": result.commit}, "content": None}), JSON, ()
+    if method in ("PUT", "POST"):
+        encoded = data.get("content")
+        if not isinstance(encoded, str):
+            return 422, dumps({
+                "message": "Validation Failed",
+                "errors": [{"resource": "Content", "field": "content", "code": "missing"}],
+            }), JSON, ()
+        try:
+            content = base64.b64decode(encoded, validate=False)
+        except Exception:
+            return 422, dumps({
+                "message": "Validation Failed",
+                "errors": [{"resource": "Content", "field": "content", "code": "invalid"}],
+            }), JSON, ()
+        expected = data.get("sha") if isinstance(data.get("sha"), str) else None
+        result = git.put_file(branch, path, content, message, name, email, when, expected)
+        if result.status == "missing_branch":
+            return 404, dumps({"message": "Branch not found"}), JSON, ()
+        if result.status == "mismatch":
+            return 409, dumps({"message": "sha does not match"}), JSON, ()
+        if result.status == "invalid":
+            return 422, dumps({"message": "Validation Failed"}), JSON, ()
+        status = 201 if result.status == "created" else 200
+        return status, dumps(_content_payload(repo, path, content, result, store)), JSON, ()
+    return 404, NOT_FOUND, JSON, ()
+
+
+def _contents_get(repo, git, branch: str, path: str, store: Store) -> tuple:
+    tip, tree = git.tip_tree(branch)
+    if tip is None:
+        return 404, NOT_FOUND, JSON, ()
+    if not path:
+        return 200, dumps(_dir_listing(repo, git, tree, "", store)), JSON, ()
+    found = git.walk(tree, [part for part in path.split("/") if part])
+    if not found:
+        return 404, NOT_FOUND, JSON, ()
+    kind, mode, sha = found
+    if kind == "tree":
+        return 200, dumps(_dir_listing(repo, git, sha, path.strip("/") + "/", store)), JSON, ()
+    blob = git.objects[sha][1]
+    return 200, dumps(_file_object(repo, path, sha, blob, store)), JSON, ()
+
+
+def _file_object(repo, path: str, sha: str, blob: bytes, store: Store) -> dict:
+    full = f"{store.login}/{repo.name}"
+    name = path.rsplit("/", 1)[-1]
+    return {
+        "type": "file",
+        "encoding": "base64",
+        "size": len(blob),
+        "name": name,
+        "path": path,
+        "sha": sha,
+        "content": base64.b64encode(blob).decode(),
+        "url": f"/api/v3/repos/{full}/contents/{path}",
+        "html_url": f"/{full}/blob/{repo.default_branch}/{path}",
+        "download_url": f"/{full}/raw/{repo.default_branch}/{path}",
+        "git_url": f"/api/v3/repos/{full}/git/blobs/{sha}",
+    }
+
+
+def _dir_listing(repo, git, tree_sha: str, prefix: str, store: Store) -> list:
+    from gitstore import parse_tree
+
+    full = f"{store.login}/{repo.name}"
+    entries = []
+    for mode, name, sha in parse_tree(git.objects[tree_sha][1]):
+        is_dir = mode == "40000"
+        path = f"{prefix}{name}"
+        size = 0 if is_dir else len(git.objects[sha][1])
+        entries.append({
+            "type": "dir" if is_dir else "file",
+            "name": name,
+            "path": path,
+            "sha": sha,
+            "size": size,
+            "url": f"/api/v3/repos/{full}/contents/{path}",
+            "html_url": f"/{full}/{'tree' if is_dir else 'blob'}/{repo.default_branch}/{path}",
+            "download_url": None if is_dir else f"/{full}/raw/{repo.default_branch}/{path}",
+        })
+    return entries
+
+
+def _content_payload(repo, path: str, content: bytes, result, store: Store) -> dict:
+    return {
+        "content": _file_object(repo, path, result.blob, content, store),
+        "commit": {
+            "sha": result.commit,
+            "message": result.message,
+            "tree": {"sha": result.tree},
+            "parents": [{"sha": parent} for parent in result.parents],
+            "html_url": f"/{store.login}/{repo.name}/commit/{result.commit}",
+            "author": {"name": store.login, "email": f"{store.login}@users.noreply.github.com", "date": store.now},
+            "committer": {"name": store.login, "email": f"{store.login}@users.noreply.github.com", "date": store.now},
+        },
+    }
+
+
+def _pulls(method: str, repo: Repo, rest: list[str], query: dict, body: bytes, host: str, path: str, store: Store) -> tuple:
+    from gitstore import ensure_git
+
+    ensure_git(repo, store)
+    if not rest:
+        if method == "POST":
+            data = parse_body(body)
+            if data is BAD:
+                return 400, BAD_JSON, JSON, ()
+            status, payload = store.create_pull(repo, data)
+            return status, dumps(payload), JSON, ()
+        if method == "GET":
+            state = (query.get("state") or ["open"])[0]
+            with repo.lock:
+                pulls = list(repo.pulls.values())
+            if state == "closed":
+                pulls = [pull for pull in pulls if pull.state == "closed"]
+            elif state != "all":
+                pulls = [pull for pull in pulls if pull.state == "open"]
+            pulls.sort(key=lambda pull: pull.number, reverse=True)
+            chunk, page, per_page, total = paginate(pulls, query)
+            payload = dumps([store.pull_public(repo, pull) for pull in chunk])
+            link = link_header(path.split("?", 1)[0], host, page, per_page, total)
+            headers = (("Link", link),) if link else ()
+            return 200, payload, JSON, headers
+        return 404, NOT_FOUND, JSON, ()
+    if not rest[0].isdigit():
+        return 404, NOT_FOUND, JSON, ()
+    number = int(rest[0])
+    pull = repo.pulls.get(number)
+    if pull is None:
+        return 404, NOT_FOUND, JSON, ()
+    if len(rest) == 1 and method == "GET":
+        return 200, dumps(store.pull_public(repo, pull)), JSON, ()
+    if len(rest) == 2 and rest[1] == "merge" and method == "PUT":
+        data = parse_body(body)
+        if data is BAD:
+            return 400, BAD_JSON, JSON, ()
+        status, payload = store.merge_pull(repo, pull, data)
         return status, dumps(payload), JSON, ()
     return 404, NOT_FOUND, JSON, ()

@@ -21,6 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import gitstore  # noqa: E402
 import rest  # noqa: E402
 from store import get_store  # noqa: E402
 
@@ -204,7 +205,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         host = self.headers.get("Host", "localhost")
         try:
-            result = rest.handle_rest(method, pth, query, body, host)
+            if gitstore.parse_git_path(pth) is not None:
+                result = gitstore.handle_git(method, pth, query, body, self.headers.get("Git-Protocol", ""))
+            else:
+                result = rest.handle_rest(method, pth, query, body, host)
         except Exception:
             self._emit(500, json.dumps({"message": "Internal Server Error"}).encode(), rest.JSON, ())
             return
