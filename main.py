@@ -107,6 +107,10 @@ class ForgeServer(ThreadingHTTPServer):
             pass
         super().process_request(request, client_address)
 
+    def handle_error(self, request, client_address):
+        # Keep-alive clients often reset the socket; that is not a forge fault.
+        return
+
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -115,6 +119,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         return
+
+    def handle(self):
+        try:
+            super().handle()
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, TimeoutError):
+            # The client closed a keep-alive socket between requests.
+            return
 
     def handle_expect_100(self):
         self.wfile.write(b"HTTP/1.1 100 Continue\r\n\r\n")
